@@ -1,8 +1,6 @@
-import math
-from collections import OrderedDict
-from itertools import chain
+from itertools import islice
 from os import path, listdir
-from typing import Tuple
+from typing import Tuple, List
 
 import cv2
 import numpy as np
@@ -10,88 +8,64 @@ import pandas as pd
 from PIL import Image
 from noformat import File
 from tiffcapture import opentiff
+from tiffcapture.tiffcapture import TiffCapture
 
-EDGE_SIZE = 5
-SCALE_FACTOR = 0.00390625
-TASTE_N_FRAMES = 25
-WARP_MAT = np.float32([[1, 0, 0], [0, 1, 0]])
+from .roi_reader import Oval, Roi
 
-
-def match(img: np.ndarray, template: np.ndarray) -> Tuple[int, int]:
-    res = cv2.matchTemplate(img, template, cv2.TM_SQDIFF_NORMED)
-    _, _, min_location, _ = cv2.minMaxLoc(res)
-    return min_location
-
-
-def apply_frame(summation: np.ndarray, sq_summation: np.ndarray, frame: np.ndarray, x: int,
-                y: int) -> None:
-    x_end = x + frame.shape[0]
-    y_end = y + frame.shape[1]
-    summation[x: x_end, y: y_end] += frame
-    sq_summation[x: x_end, y: y_end] += frame.astype(np.uint32) ** 2
-
-
-def oval_mask(height: int, width: int) -> np.ndarray:
-    result = np.zeros((height, width), dtype=np.bool)
-    a, b = height / 2 - 0.3, width / 2 - 0.3
-    half_height, half_width = (height - 1) / 2, (width - 1) / 2
-    for idx, row in enumerate(result):
-        span = math.sqrt(1 - ((half_height - idx) / a) ** 2) * b
-        row[int(round(half_width - span + 0.5)): int(round(half_width + span + 0.5))] = True
-    return result
+EDGE_SIZE = (50, 15)
 
 
 class Alignment(object):
+    n_frames_for_template = 25
     _template = None
     displacement = None
     mean_frame = None
     std_frame = None
     target_path = None
 
-    def __init__(self, img_path, edge_size: int = EDGE_SIZE):
-        self.img = opentiff(img_path)
-        self.edge_size = edge_size
-        self.img_path = img_path
+    def __init__(self, img_path, edge_size: Tuple[int, int] = EDGE_SIZE):
+        if isinstance(img_path, str):
+            self.img = opentiff(img_path)
+            self.img_path = img_path
+        elif isinstance(img_path, TiffCapture):
+            self.img = img_path
+            self.img_path = ''
+        self.edge = np.array(edge_size, dtype=np.int32)
 
     def __del__(self):
         self.img.release()
 
     @property
-    def template(self):
+    def template(self) -> np.ndarray:
         """create a template from the average frame of a roughly aligned stack"""
-        if not self._template:
-            img, edge_size = self.img, self.edge_size
+        if self._template is None:
+            img, edge = self.img, self.edge
             img.seek(0)
-            summation = np.zeros(img.shape, dtype=np.uint64)
-            std = [np.std(next(img)) for _ in range(TASTE_N_FRAMES)]
-            best_frame_id = np.argmax(std) + 1  # type: int
-            best_frame = np.multiply(img.find_and_read(best_frame_id),
-                                     SCALE_FACTOR).astype(np.uint8)
-            template = best_frame[edge_size: -edge_size, edge_size: -edge_size]
-            summation += best_frame
-            top_left = np.array([edge_size, edge_size])
-            for idx in chain(range(best_frame_id), range(best_frame_id + 1, img.length)):
-                frame = np.multiply(img.find_and_read(idx), SCALE_FACTOR).astype(np.uint8)
-                res = np.subtract(match(frame, template), top_left)
-                WARP_MAT[:, 2] = res
-                summation += cv2.warpAffine(frame, WARP_MAT, frame.shape)
-            mean_frame = np.divide(summation, img.length - 1).astype(np.uint8)
-            self._template = mean_frame[edge_size: -edge_size, edge_size: -edge_size]
+            best_frame_id = np.argmax(list(islice(map(np.std, img), self.n_frames_for_template)))
+            template = (img.find_and_read(best_frame_id)[edge[1]: -edge[1], edge[0]: -edge[0]]).astype(np.float32)
+            summation = np.zeros(img.shape[::-1], dtype=np.float64)
+            img.seek(0)
+            for idx, frame in enumerate(img):
+                frame = frame.astype(np.float32)
+                apply_sum(summation, frame, *match(frame, template, edge))
+            mean_frame = np.divide(summation, img.length - 1).astype(np.float32)
+            self._template = mean_frame[edge[1]: -edge[1], edge[0]: -edge[0]]  # type: np.ndarray
+        # noinspection PyTypeChecker
         return self._template
 
-    def get_displacement(self):
-        template, img, edge_size = self.template, self.img, self.edge_size
-        length, shape = img.length, img.shape
-        top_left = np.array([edge_size, edge_size])
+    def align(self):
+        template, img, edge = self.template, self.img, np.array(self.edge)
+        length, shape = img.length, img.shape[::-1]
         displacement = np.zeros((length, 2), dtype=np.int32)
-        summation = np.zeros(shape, dtype=np.uint64)
-        sq_summation = np.zeros_like(shape, dtype=np.uint64)
-        for idx in range(length):
-            frame = np.multiply(img.find_and_read(idx), SCALE_FACTOR).astype(np.uint8)
-            res = np.subtract(match(frame, template), top_left)
-            displacement[idx, :] = res
-            apply_frame(summation, sq_summation, frame, *(res + top_left))
-        self.displacement = displacement
+        summation = np.zeros(shape, dtype=np.float64)
+        sq_summation = np.zeros(shape, dtype=np.float64)
+        img.seek(0)
+        for idx, frame in enumerate(img):
+            frame = frame.astype(np.float32)
+            translation = match(frame, template, edge)
+            displacement[idx, :] = translation
+            apply_frame(summation, sq_summation, frame, *translation)
+        self.displacement = displacement - np.round(displacement.mean(0)).astype(np.int32)
         self.mean_frame = summation / length
         self.std_frame = np.sqrt((sq_summation - summation ** 2 / length) / length)
 
@@ -118,26 +92,78 @@ class Alignment(object):
             target_path = self.target_path if self.target_path else self.img_path.rpartition('.')[0]
         output = File(target_path, 'w+')
         output.attrs['img_path'] = self.img_path
-        output.attrs['edge_size'] = self.edge_size
-        if self.displacement:
+        output.attrs['edge_size'] = self.edge
+        if self.displacement is not None:
             output['displacement'] = self.displacement
-        if self._template:
+        if self._template is not None:
             output['template'] = self.template
-        if self.mean_frame:
-            temp_img = Image.fromarray(self.mean_frame, 'I')
+        if self.mean_frame is not None:
+            temp_img = Image.fromarray(full_contrast(self.mean_frame), 'L')
             temp_img.save(path.join(target_path, 'mean_frame.tif'))
-        if self.std_frame:
-            temp_img = Image.fromarray(self.std_frame, 'I')
+        if self.std_frame is not None:
+            temp_img = Image.fromarray(full_contrast(self.std_frame), 'L')
             temp_img.save(path.join(target_path, 'std_frame.tif'))
 
-    def apply_roi(self, roi_list: OrderedDict,
-                  stretched: Tuple[int, int]) -> pd.DataFrame:
-        column_names = list()
-        mask_list = list()
-        stretch_index = np.divide(self.img.shape, stretched)
-        for key, value in roi_list:
-            column_names.extend([key + '_mean', key + '_area'])
-            # TODO: convert roi to masks with coordinates
-        # TODO: apply these roi mask to displaced frames
-        result = np.empty((self.img.length, len(roi_list) * 2))
+    def measure_roi(self, roi_list: List[Oval],
+                    stretched: Tuple[int, int] = None) -> pd.DataFrame:
+        if stretched is not None:
+            stretch_index = np.divide(np.flipud(self.mean_frame.shape), stretched)
+            for roi in roi_list:
+                roi.stretch(*stretch_index)
+        column_names = [roi.name + '_mean' for roi in roi_list]
+        result = np.empty((self.img.length, len(roi_list)))
+        self.img.seek(0)
+        for idx, frame in enumerate(self.img):
+            result[idx, :] = get_measurement(frame, self.displacement[idx], roi_list)
         return pd.DataFrame(data=result, columns=column_names)
+
+
+def apply_sum(summation: np.ndarray, frame: np.ndarray, x: int, y: int) -> None:
+    assert (summation.shape == frame.shape)
+    a1 = np.maximum([y, x], 0)
+    b1 = np.maximum([-y, -x], 0)
+    a2, b2 = frame.shape - b1, frame.shape - a1
+    summation[a1[0]: a2[0], a1[1]: a2[1]] += frame[b1[0]: b2[0], b1[1]: b2[1]]
+
+
+def apply_frame(summation: np.ndarray, sq_summation: np.ndarray, frame: np.ndarray, x: int,
+                y: int) -> None:
+    a1 = np.maximum([y, x], 0)
+    b1 = np.maximum([-y, -x], 0)
+    a2, b2 = frame.shape - b1, frame.shape - a1
+    summation[a1[0]: a2[0], a1[1]: a2[1]] += frame[b1[0]: b2[0], b1[1]: b2[1]]
+    sq_summation[a1[0]: a2[0], a1[1]: a2[1]] += (frame[b1[0]: b2[0], b1[1]: b2[1]]) ** 2
+
+
+def extract_data(frame: np.ndarray, displacement: Tuple[int, int], roi_list: List[Oval],
+                 mask_list: List[np.ndarray]) -> list:
+    result = list()
+    for roi, mask in zip(roi_list, mask_list):
+        patch = frame[roi.y1 - displacement[1]: roi.y2 - displacement[1],
+                      roi.x1 - displacement[0]: roi.x2 - displacement[0]]
+        result.append(patch[mask].sum())
+    return result
+
+
+def full_contrast(x: np.ndarray) -> np.ndarray:
+    if np.issubdtype(x.dtype, np.integer) and np.iinfo(x.dtype).max < (x.max() * 255):
+        return np.round((x - x.min()).astype(np.uint32) * 255 / (x.max() - x.min())).astype(np.uint8)
+    else:
+        return np.round((x - x.min()) * 255 / (x.max() - x.min())).astype(np.uint8)
+
+
+def match(img: np.ndarray, template: np.ndarray, edge: np.ndarray) -> np.ndarray:
+    res = cv2.matchTemplate(img, template, cv2.TM_SQDIFF_NORMED)
+    _, _, min_location, _ = cv2.minMaxLoc(res)
+    if np.any(np.equal(min_location, edge * 2)) or np.any(np.equal(min_location, 0)):
+        return np.zeros((2,), dtype=int)
+    return np.subtract(edge, min_location)
+
+
+def get_measurement(frame: np.ndarray, displacement: Tuple[int, int], roi_list: List[Roi]) -> np.ndarray:
+    """Return roi measurement for one frame"""
+    result = np.zeros((len(roi_list),), dtype=np.uint32)
+    for idx, roi in enumerate(roi_list):
+        dx, dy = displacement
+        result[idx] = frame[roi.y1 - dy: roi.y2 - dy, roi.x1 - dx: roi.x2 - dx][roi.mask].mean()
+    return result
