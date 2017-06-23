@@ -6,6 +6,7 @@ from struct import Struct, iter_unpack
 from typing import Union, List
 from zipfile import ZipExtFile, ZipFile
 
+from scipy.misc import imresize
 import numpy as np
 from flags import Flags
 
@@ -58,6 +59,35 @@ class Roi(object):
         self.x2 = int(round(self.x2 * x_ratio))
         self.y1 = int(round(self.y1 * y_ratio))
         self.y2 = int(round(self.y2 * y_ratio))
+
+
+class DottedRoi(Roi):
+    # noinspection PyMissingConstructor
+    def __init__(self, in_data: dict):
+        self.name = in_data['id']
+        self.coordinates = np.array(in_data['coordinates'], dtype=np.int16)
+        if 'bounding_box' not in in_data:
+            self.x1, self.y1 = self.coordinates.min(0)
+            self.x2, self.y2 = self.coordinates.max(0) + 1
+            self.coordinates -= np.array([self.x1, self.y1])
+        else:
+            self.x1, self.y1, self.x2, self.y2 = in_data['bounding_box']
+
+    @property
+    def mask(self) -> np.ndarray:
+        if self._mask is None:
+            width = self.x2 - self.x1
+            height = self.y2 - self.y1
+            result = np.zeros((height, width), dtype=np.bool)  # type: np.ndarray
+            result[self.coordinates[:, 1], self.coordinates[:, 0]] = True
+            self._mask = result
+        # noinspection PyTypeChecker
+        return self._mask
+
+    def stretch(self, x_ratio: float, y_ratio: float):
+        temp_mask = self.mask
+        super(DottedRoi, self).stretch(x_ratio, y_ratio)
+        self._mask = imresize(temp_mask, (self.y2 - self.y1, self.x2 - self.x1)) > 127
 
 
 class Oval(Roi):
