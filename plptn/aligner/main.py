@@ -5,10 +5,8 @@ from typing import Tuple, List
 import cv2
 import numpy as np
 import pandas as pd
-from PIL import Image
+from libtiff import TIFF, TIFFimage
 from noformat import File
-from tiffcapture import opentiff
-from tiffcapture.tiffcapture import TiffCapture
 
 from .roi_reader import Oval, Roi
 
@@ -23,25 +21,21 @@ class Alignment(object):
     std_frame = None
     target_path = None
 
-    def __init__(self, img_path, edge_size: Tuple[int, int] = EDGE_SIZE):
-        if isinstance(img_path, str):
-            self.img = opentiff(img_path)
-            self.img_path = img_path
-        elif isinstance(img_path, TiffCapture):
-            self.img = img_path
-            self.img_path = ''
+    def __init__(self, img_path: str, edge_size: Tuple[int, int] = EDGE_SIZE):
+        self.img = TIFF.open(img_path, mode='r')
+        self.img_path = img_path
         self.edge = np.array(edge_size, dtype=np.int32)
 
     def __del__(self):
-        self.img.release()
+        self.img.close()
 
     @property
     def template(self) -> np.ndarray:
         """create a template from the average frame of a roughly aligned stack"""
         if self._template is None:
             img, edge = self.img, self.edge
-            img.seek(0)
-            best_frame_id = np.argmax(list(islice(map(np.std, img), self.n_frames_for_template)))
+            img.setdirectory(0)
+            best_frame_id = np.argmax(list(islice(map(np.std, img.iter_images()), self.n_frames_for_template)))
             template = (img.find_and_read(best_frame_id)[edge[1]: -edge[1], edge[0]: -edge[0]]).astype(np.float32)
             summation = np.zeros(img.shape[::-1], dtype=np.float64)
             img.seek(0)
@@ -80,11 +74,9 @@ class Alignment(object):
             obj.displacement = file['displacement']
         file_list = listdir(file_path)
         if 'mean_frame.tif' in file_list:
-            obj.mean_frame = np.asarray(Image.open(path.join(file_path, 'mean_frame.tif')),
-                                        dtype=np.uint16).T
+            obj.mean_frame = TIFF.open(path.join(file_path, 'mean_frame.tif'), mode='r').read_current().astype(np.uint16)
         if 'std_frame.tif' in file_list:
-            obj.std_frame = np.asarray(Image.open(path.join(file_path, 'std_frame.tif')),
-                                       dtype=np.uint16).T
+            obj.std_frame = TIFF.open(path.join(file_path, 'std_frame.tif'), mode='r').read_current().astype(np.uint16)
         return obj
 
     def save(self, target_path: str = None):
@@ -98,11 +90,11 @@ class Alignment(object):
         if self._template is not None:
             output['template'] = self.template
         if self.mean_frame is not None:
-            temp_img = Image.fromarray(full_contrast(self.mean_frame), 'L')
-            temp_img.save(path.join(target_path, 'mean_frame.tif'))
+            temp_img = TIFFimage(full_contrast(self.mean_frame), description='average')
+            temp_img.write_file(path.join(target_path, 'mean_frame.tif'), compression='none')
         if self.std_frame is not None:
-            temp_img = Image.fromarray(full_contrast(self.std_frame), 'L')
-            temp_img.save(path.join(target_path, 'std_frame.tif'))
+            temp_img = TIFFimage(full_contrast(self.std_frame), description='standard deviation')
+            temp_img.write_file(path.join(target_path, 'std_frame.tif'), compression='lzw')
 
     def measure_roi(self, roi_list: List[Oval],
                     stretched: Tuple[int, int] = None) -> pd.DataFrame:
