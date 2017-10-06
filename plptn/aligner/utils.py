@@ -2,11 +2,35 @@ from typing import Union, Tuple, Callable
 import numpy as np
 from libtiff import libtiff, TIFF
 # noinspection PyUnresolvedReferences
-from libtiff.libtiff_ctypes import PLANARCONFIG_CONTIG, COMPRESSION_NONE, PLANARCONFIG_SEPARATE
+from libtiff.libtiff_ctypes import PLANARCONFIG_CONTIG, COMPRESSION_NONE, PLANARCONFIG_SEPARATE, suppress_warnings
+
+suppress_warnings()
 
 
-class TiffImage(object):
+def bisect(func: Callable[[int], bool], start: int=0, end: int=1000) -> int:
+    """given a sequence where func returns true for start to N - 1 and func returns false for N to end - 1,
+    calculates N"""
+    if not func(start):
+        return start
+    if func(end - 1):
+        return end
+    while end - start > 1:
+        middle = (end + start) // 2
+        if func(middle):
+            start = middle
+        else:
+            end = middle
+    return end
+
+
+def save_tiff(arr: np.ndarray, file_path: str) -> None:
+    temp_img = TIFF.open(file_path, 'w')
+    temp_img.write_image(arr)
+
+
+class TiffReader(object):
     _shape = None
+    _length = None
     _tiff_ptr = None
     _read_func = None  # type: Callable
     _template_frame = None  # type: np.ndarray
@@ -16,7 +40,7 @@ class TiffImage(object):
 
     @classmethod
     def open(cls, filename: Union[str, bytes], mode: str='r'):
-        return TiffImage(TIFF.open(filename, mode))
+        return TiffReader(TIFF.open(filename, mode))
 
     def __iter__(self):
         yield self.read_current()
@@ -29,8 +53,18 @@ class TiffImage(object):
         libtiff.TIFFSetDirectory(self._tiff_ptr, item)
         return self.read_current()
 
+    def __del__(self):
+        self._tiff_ptr.close()
+
     def seek(self, index: int):
         libtiff.TIFFSetDirectory(self._tiff_ptr, index)
+
+    @property
+    def length(self) -> int:
+        if self._length is None:
+            self._length = bisect(self._tiff_ptr.setdirectory, 0, 100000)
+        # noinspection PyTypeChecker
+        return self._length
 
     @property
     def shape(self) -> Tuple[int, int]:

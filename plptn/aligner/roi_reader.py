@@ -10,6 +10,7 @@ from scipy.misc import imresize
 import numpy as np
 from flags import Flags
 
+# noinspection SpellCheckingInspection
 roi_fmt = Struct('>4sHBx4hH4fH3I2H2BHII')
 sub_pixel_fmt = Struct('>4f')
 RoiFull = namedtuple("RoiFull", "magic version type y1 x1 y2 x2 n_coordinates fx1 fy1 fx2 "

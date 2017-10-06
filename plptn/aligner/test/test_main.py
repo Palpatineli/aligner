@@ -4,7 +4,7 @@ import numpy as np
 from pkg_resources import Requirement, resource_stream
 from pytest import fixture
 
-from ..main import match, apply_sum, Alignment
+from ..align import match, apply_sum, Alignment
 from ..roi_reader import read_roi_zip
 
 TEST_DATA_FOLDER = "plptn/aligner/test/data"
@@ -60,9 +60,9 @@ def test_apply_sum(test_pic):
 
 @fixture
 def test_stack():
-    from tiffcapture import opentiff
+    from libtiff import TIFF
     stream = resource_stream(Requirement.parse('aligner'), join(TEST_DATA_FOLDER, 'test_stack.tiff'))
-    pic = opentiff(stream)
+    pic = TIFF(stream)
     yield pic
     stream.close()
 
@@ -80,5 +80,5 @@ def test_apply_roi(test_stack, test_stack_roi):
     session = Alignment(test_stack, edge_size=(10, 10))
     session.align()
     measurement = session.measure_roi(test_stack_roi)
-    for col, value in measurement.iteritems():
-        assert np.std(value) == 0
+    for row in measurement['data']:
+        assert np.std(row) == 0
