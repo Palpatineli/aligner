@@ -16,7 +16,7 @@ EDGE_SIZE = (25, 15)
 
 
 class Alignment(object):
-    n_frames_for_template = 25
+    n_frames_for_template = 50
     _template = None        # type: np.ndarray
     displacement = None     # type: np.ndarray
     mean_frame = None       # type: np.ndarray
@@ -71,12 +71,12 @@ class Alignment(object):
         displacement = list()
         summation = np.zeros(shape, dtype=np.float64)
         sq_summation = np.zeros(shape, dtype=np.float64)
-        img.seek(self.strong_channel)
+        img.seek(0)
         for idx, frame in enumerate(iter(img)):
             frame = frame.astype(np.float32)
             translation = match(frame, template, edge)
             displacement.append(translation)
-            if not self.two_channels or idx % 2 == 0:
+            if not self.two_channels or idx % 2 == self.strong_channel:
                 apply_frame(summation, sq_summation, frame, *translation)
         self.displacement = np.array(displacement)
         self.mean_frame = summation / length
@@ -85,7 +85,11 @@ class Alignment(object):
     @classmethod
     def load(cls, file_path: str):
         file = File(file_path, 'r')
-        obj = cls(**{x: file.attrs[x] for x in ('img_path', 'edge_size', 'two_channels')})
+        attrs = file.attrs
+        img_path = attrs['img_path']
+        if not path.isabs(img_path):
+            img_path = path.join(file_path, img_path)
+        obj = cls(img_path, attrs['edge_size'], attrs['two_channels'])
         obj.target_path = file_path
         for x in ('frame_rate', 'strong_channel'):
             setattr(obj, x, file.attrs[x])
@@ -103,9 +107,10 @@ class Alignment(object):
              draw_limit: bool=False):
         target_path = target_path if target_path else self.target_path
         output = File(target_path, 'w+')
-        fields = ('img_path', 'edge_size', 'frame_rate', 'two_channels', 'strong_channel')
+        fields = ('edge_size', 'frame_rate', 'two_channels', 'strong_channel')
         for x in fields:
             output.attrs[x] = getattr(self, x)
+        output.attrs['img_path'] = path.relpath(target_path, self.img_path)
         if self.displacement is not None:
             output['displacement'] = self.displacement
         if self._template is not None:
@@ -150,12 +155,12 @@ class Alignment(object):
         save_file = File(save_path, 'w+')
         time_series = np.arange(self.displacement.shape[0]) / self.frame_rate
         if self.two_channels:
-            save_file['measurement-chan1'] = dict(data=result[:, ::2], row=neuron_names, column=time_series)
-            save_file['measurement-chan2'] = dict(data=result[:, 1::2], row=neuron_names, column=time_series)
+            save_file['measurement-chan1'] = {'data': result[:, ::2], 'x': neuron_names, 'y': time_series}
+            save_file['measurement-chan2'] = {'data': result[:, 1::2], 'x': neuron_names, 'y': time_series}
             if return_result:
                 return save_file['measurement-chan1'], save_file['measurement-chan2']
         else:
-            save_file['measurement'] = dict(data=result, row=neuron_names, column=time_series)
+            save_file['measurement'] = {'data': result, 'x': neuron_names, 'y': time_series}
             if return_result:
                 return save_file['measurement']
 

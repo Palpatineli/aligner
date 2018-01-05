@@ -62,7 +62,7 @@ def test_apply_sum(test_pic):
 def test_stack():
     from libtiff import TIFF
     stream = resource_stream(Requirement.parse('aligner'), join(TEST_DATA_FOLDER, 'test_stack.tiff'))
-    pic = TIFF(stream)
+    pic = TIFF.open(stream)
     yield pic
     stream.close()
 

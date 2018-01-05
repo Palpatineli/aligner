@@ -31,6 +31,7 @@ def convert_timestamp(folder: str, ext: str=".log") -> None:
 
 @FolderSelector
 def rearrange_folder(folder: str):
+    print("rearranging folder: " + folder)
     date_str = path.split(folder)[1]
     chdir(folder)
     distribute_log(folder)
