@@ -1,4 +1,5 @@
-from typing import Union, Tuple, Callable
+from typing import Union, Tuple, List, Callable, Optional
+import subprocess as sp
 import numpy as np
 from libtiff import libtiff, TIFF
 # noinspection PyUnresolvedReferences
@@ -7,36 +8,33 @@ from libtiff.libtiff_ctypes import PLANARCONFIG_CONTIG, COMPRESSION_NONE, PLANAR
 suppress_warnings()
 
 
-def bisect(func: Callable[[int], bool], start: int=0, end: int=1000) -> int:
-    """given a sequence where func returns true for start to N - 1 and func returns false for N to end - 1,
-    calculates N"""
-    if not func(start):
-        return start
-    if func(end - 1):
-        return end
-    while end - start > 1:
-        middle = (end + start) // 2
-        if func(middle):
-            start = middle
-        else:
-            end = middle
-    return end
-
-
 def save_tiff(arr: np.ndarray, file_path: str) -> None:
     temp_img = TIFF.open(file_path, 'w')
     temp_img.write_image(arr)
 
 
+def tiffinfo(img_path: str, fields: List[str]) -> List[Optional[int]]:
+    def _extract(text_str: str, find_str: str) -> Optional[int]:
+        find_str_len = len(find_str)
+        start_idx = text_str.find(find_str)
+        if start_idx == -1:
+            return None
+        end_idx = text_str.find(' ', start_idx + find_str_len)
+        end_idx = min(end_idx, text_str.find('\n', start_idx + find_str_len))
+        return int(text_str[start_idx + find_str_len: end_idx])
+
+    output = sp.check_output(['tiffinfo', '-0', img_path]).decode('utf-8')
+    return [_extract(output, field) for field in fields]
+
+
 class TiffReader(object):
     _shape = None
     _length = None
-    _tiff_ptr = None
-    _read_func = None  # type: Callable
-    _template_frame = None  # type: np.ndarray
+    _read_func: Optional[Callable] = None
+    _template_frame: Optional[np.ndarray] = None
 
-    def __init__(self, tiff_obj: TIFF):
-        self._tiff_ptr = tiff_obj
+    def __init__(self, tiff_obj: TIFF) -> None:
+        self._tiff_ptr: TIFF = tiff_obj
 
     @classmethod
     def open(cls, filename: Union[str, bytes], mode: str='r'):
@@ -47,6 +45,7 @@ class TiffReader(object):
         while not libtiff.TIFFLastDirectory(self._tiff_ptr):
             libtiff.TIFFReadDirectory(self._tiff_ptr)
             yield self.read_current()
+        yield self.read_current()
         raise StopIteration
 
     def __getitem__(self, item: int) -> np.ndarray:
@@ -62,8 +61,14 @@ class TiffReader(object):
     @property
     def length(self) -> int:
         if self._length is None:
-            self._length = bisect(self._tiff_ptr.setdirectory, 0, 100000)
-        # noinspection PyTypeChecker
+            filename = self._tiff_ptr.filename()
+            _lengths = tiffinfo(filename, ["images=", "SI.hScan2D.logFramesPerFile = ",
+                                           "SI.hStackManager.framesPerSlice = "])
+            try:
+                _length = next(x for x in _lengths if x is not None)
+            except StopIteration:
+                raise ValueError("frame number cannot be determined for: ", filename)
+            self._length = _length
         return self._length
 
     @property
@@ -105,8 +110,7 @@ class TiffReader(object):
         size = arr.nbytes
         tiff_ptr = self._tiff_ptr
         for strip in range(libtiff.TIFFNumberOfStrips(tiff_ptr).value):
-            # noinspection PyCallingNonCallable
-            elem = read_func(tiff_ptr, strip, pointer, max(size, 0)).value
+            elem = read_func(tiff_ptr, strip, pointer, max(size, 0)).value   # type: ignore
             pointer += elem
             size -= elem
         return arr

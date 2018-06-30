@@ -6,13 +6,13 @@ from numba import jit
 def masked_mean(input_mat, x1, y1, mask):
     y_range, x_range = mask.shape
     count = 0
-    sum = 0.0
+    summation = 0.0
     for m_y in range(y_range):
         for m_x in range(x_range):
             if mask[m_y, m_x]:
                 count += 1
-                sum += input_mat[m_y + y1, m_x + x1]
-    return sum / count
+                summation += input_mat[m_y + y1, m_x + x1]
+    return summation / count if count > 0 else 0
 
 
 @jit(nogil=True, nopython=True, cache=True)
@@ -47,5 +47,3 @@ def apply_frame(summation: np.ndarray, sq_summation: np.ndarray, frame: np.ndarr
             summation[i, j] += temp
             sq_summation[i, j] += temp ** 2
     return summation, sq_summation
-
-

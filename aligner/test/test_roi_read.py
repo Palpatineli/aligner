@@ -23,6 +23,7 @@ def fov_1_roi_target():
     stream.close()
 
 
+# noinspection PyShadowingNames
 def test_read_roi_zip(fov_1_roi, fov_1_roi_target):
     roi_list = read_roi_zip(fov_1_roi)
     roi_list_target = fov_1_roi_target

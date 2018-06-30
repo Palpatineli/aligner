@@ -80,5 +80,5 @@ def test_apply_roi(test_stack, test_stack_roi):
     session = Alignment(test_stack, edge_size=(10, 10))
     session.align()
     measurement = session.measure_roi(test_stack_roi)
-    for row in measurement['data']:
+    for row in measurement[0]['data']:
         assert np.std(row) == 0
