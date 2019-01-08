@@ -1,5 +1,7 @@
 from typing import Union, Tuple, List, Callable, Optional
+from os import path
 import subprocess as sp
+import re
 import numpy as np
 from libtiff import libtiff, TIFF
 # noinspection PyUnresolvedReferences
@@ -12,6 +14,17 @@ def save_tiff(arr: np.ndarray, file_path: str) -> None:
     temp_img = TIFF.open(file_path, 'w')
     temp_img.write_image(arr)
 
+def binary_search(seq, func, max_size):
+    start, end = 0, max_size
+    while end - start > 1:
+        middle = (end + start) // 2
+        if func(seq[middle]) > 0:
+            start = middle
+        else:
+            end = middle
+    return end
+
+_max_size = 65535
 
 def tiffinfo(img_path: str, fields: List[str]) -> List[Optional[int]]:
     def _extract(text_str: str, find_str: str) -> Optional[int]:
@@ -26,10 +39,21 @@ def tiffinfo(img_path: str, fields: List[str]) -> List[Optional[int]]:
     output = sp.check_output(['tiffinfo', '-0', img_path]).decode('utf-8')
     return [_extract(output, field) for field in fields]
 
+def _tsplit(string, *delimiters):
+    pattern = '|'.join(map(re.escape, delimiters))
+    return re.split(pattern, string)
+
+def _written_frame_count(tif_path: str) -> Optional[int]:
+    basename = path.splitext(path.split(tif_path)[-1])[0]
+    if "Frames" in basename:
+        return int(next(x for x in _tsplit(basename, '-', '_') if "Frames" in x)[0: -6])
+    else:
+        return None
+
 
 class TiffReader(object):
     _shape = None
-    _length = None
+    _length: Optional[int] = None
     _read_func: Optional[Callable] = None
     _template_frame: Optional[np.ndarray] = None
 
@@ -37,7 +61,7 @@ class TiffReader(object):
         self._tiff_ptr: TIFF = tiff_obj
 
     @classmethod
-    def open(cls, filename: Union[str, bytes], mode: str='r'):
+    def open(cls, filename: Union[str, bytes], mode: str = 'r'):
         return TiffReader(TIFF.open(filename, mode))
 
     def __iter__(self):
@@ -61,14 +85,7 @@ class TiffReader(object):
     @property
     def length(self) -> int:
         if self._length is None:
-            filename = self._tiff_ptr.filename()
-            _lengths = tiffinfo(filename, ["images=", "SI.hScan2D.logFramesPerFile = ",
-                                           "SI.hStackManager.framesPerSlice = "])
-            try:
-                _length = next(x for x in _lengths if x is not None)
-            except StopIteration:
-                raise ValueError("frame number cannot be determined for: ", filename)
-            self._length = _length
+            self._length = binary_search(np.arange(_max_size), lambda x: libtiff.TIFFSetDirectory(self._tiff_ptr, x), _max_size)
         return self._length
 
     @property
@@ -91,7 +108,7 @@ class TiffReader(object):
                 planar_config = PLANARCONFIG_CONTIG
             compression = get_field('Compression')
             compression = None if compression == COMPRESSION_NONE else compression
-            self._read_func = libtiff.TIFFReadEncodedStrip if compression else libtiff.TIFFReadRawStrip
+            self._read_func = libtiff.TIFFReadEncodedStrip
             dtype = self._tiff_ptr.get_numpy_type(bits, sample_format)
             if samples_pp == 1:  # only 2 dimensions
                 self._template_frame = np.empty(self.shape, dtype)
