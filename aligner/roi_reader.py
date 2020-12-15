@@ -2,14 +2,15 @@ from typing import Dict
 from collections import namedtuple
 from io import BufferedIOBase, BytesIO
 from math import sqrt
+from pathlib import Path
 from os.path import basename, splitext
 from struct import Struct, iter_unpack
 from typing import Union, List
 from zipfile import ZipExtFile, ZipFile  # type: ignore
 
-from scipy.misc import imresize
 import numpy as np
 from flags import Flags
+from .utils import imresize
 
 # noinspection SpellCheckingInspection
 roi_fmt = Struct('>4sHBx4hH4fH3I2H2BHII')
@@ -31,7 +32,7 @@ class Roi(object):
     __conversion__: Dict[str, str] = dict()
     _mask = None
 
-    def __init__(self, name: str, base_roi: RoiFull, options: Options, header_2: Header2 = None,
+    def __init__(self, name: str, base_roi: RoiFull, options: Options, header_2: Header2 = None,  # type: ignore
                  extra_data: dict = None) -> None:
         self.name = name
         for field_id in self.__slots__:
@@ -55,10 +56,10 @@ class Roi(object):
         raise NotImplementedError
 
     def stretch(self, x_ratio: float, y_ratio: float) -> None:
-        self.x1 = int(round(self.x1 * x_ratio))
-        self.x2 = int(round(self.x2 * x_ratio))
-        self.y1 = int(round(self.y1 * y_ratio))
-        self.y2 = int(round(self.y2 * y_ratio))
+        self.x1: int = int(round(self.x1 * x_ratio))
+        self.x2: int = int(round(self.x2 * x_ratio))
+        self.y1: int = int(round(self.y1 * y_ratio))
+        self.y2: int = int(round(self.y2 * y_ratio))
 
     @property
     def is_empty(self) -> bool:
@@ -266,3 +267,39 @@ def read_roi_file(data: bytes, name: str) -> Roi:
     else:
         raise NotImplementedError("Roi of type number {0} is not implemented".format(roi_full.type))
     return roi
+
+def search_ar(x, y):
+    """Find the indices of x elements in y."""
+    x = np.asarray(x)
+    y = np.asarray(y, dtype=x.dtype)
+    argy = np.argsort(y)
+    argx = np.argsort(x)
+    rev_argx = np.argsort(argx)
+    sortedy2sortedx = np.searchsorted(y[argy], x[argx])
+    return argy[sortedy2sortedx[rev_argx]]
+
+def diff_orderd(x, y):
+    """Find y elements not in x, but ordered as they are in y."""
+    diff = np.setdiff1d(y, x)
+    return diff[np.argsort(search_ar(diff, y))]
+
+def update(source: Path, target: Path) -> List[str]:
+    """Update the ROI list in target from those in source.
+    ROI that are missing in target will be added from source,
+    appened to the end and follow the order in source.
+    Args:
+        source, target: Path of the zip file of imagej ROIs.
+    Returns:
+        ROI names that are added.
+    """
+    with ZipFile(source, 'r') as fp:
+        source_list = fp.namelist()
+    with ZipFile(target, 'r') as fp:
+        target_list = fp.namelist()
+    diff = diff_orderd(target_list, source_list)
+    if len(diff) == 0:
+        return []
+    with ZipFile(source, 'r') as sfp, ZipFile(target, 'a') as wfp:
+        for file_name in diff:
+            wfp.writestr(file_name, sfp.read(file_name))
+    return diff

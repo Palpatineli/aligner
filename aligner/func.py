@@ -5,13 +5,17 @@ from numba import jit
 @jit(nopython=True, nogil=True, cache=True)
 def masked_mean(input_mat, x1, y1, mask):
     y_range, x_range = mask.shape
+    y_max, x_max = input_mat.shape
     count = 0
     summation = 0.0
     for m_y in range(y_range):
         for m_x in range(x_range):
             if mask[m_y, m_x]:
-                count += 1
-                summation += input_mat[m_y + y1, m_x + x1]
+                y = m_y + y1
+                x = m_x + x1
+                if y >= 0 and y < y_max and x >= 0 and x < x_max:
+                    count += 1
+                    summation += input_mat[y, x]
     return summation / count if count > 0 else 0
 
 

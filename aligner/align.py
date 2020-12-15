@@ -1,16 +1,19 @@
+from typing import Tuple, List, Dict, Union
 import re
 from itertools import islice
-from os import path, scandir
-from typing import Tuple, List, Dict, Union
+from os import path
+import os
+import json
+from pathlib import Path
 
 import cv2
 import numpy as np
-from noformat import File
-from scipy.signal import medfilt2d
+# from scipy.signal import medfilt2d
 from scipy.ndimage import zoom
+from noformat import File
+from tiffreader import TiffReader, TiffFolderReader, save_tiff, tiffinfo
 
 from .roi_reader import Roi
-from .utils import TiffReader, save_tiff
 from .func import masked_mean, apply_sum, apply_frame
 
 EDGE_SIZE = (25, 15)
@@ -20,32 +23,40 @@ Point = Tuple[int, int]
 
 
 class Alignment(object):
+    """img is a temporary pointer to the TIFF file and needs to be created in all functions because otherwise
+    it cannot be pickled to be used for multiprocessing."""
     n_frames_for_template = 50
-    _template: np.ndarray = None
-    displacement: np.ndarray = None
-    mean_frame: np.ndarray = None
-    std_frame: np.ndarray = None
+    _template: np.ndarray
+    displacement: np.ndarray
+    mean_frame: np.ndarray
+    std_frame: np.ndarray
     attributes: Json = {}
     two_channels = False
     _fields: Tuple[str, ...] = ('edge_size', 'frame_rate', 'two_channels')
     _channel_no = 1
 
     def __init__(self, img_path: str, edge_size: Point = EDGE_SIZE) -> None:
-        self.img = TiffReader.open(img_path)
+        if Path(img_path).is_dir():
+            self.img_opener = TiffFolderReader
+            self.target_path: str = path.join(path.dirname(img_path), "aligned-" + path.basename(img_path))
+        else:
+            self.img_opener = TiffReader
+            self.target_path: str = path.splitext(img_path)[0]
         self.img_path = img_path
-        self.target_path: str = path.splitext(img_path)[0]
         self.edge_size = edge_size
-        self.frame_rate = _get_frame_rate(img_path)
+        self.frame_rate = _get_frame_rate(Path(img_path))
 
     @staticmethod
-    def _get_std(frame: np.ndarray) -> float:
-        return medfilt2d(frame.astype(np.float32)).std()
+    def _get_std(frame: np.ndarray) -> np.ndarray:
+        return frame.astype(np.float32).std()
+        # return medfilt2d(frame.astype(np.float32)).std()
 
     @property
     def template(self) -> np.ndarray:
         """create a template from the average frame of a roughly aligned stack"""
-        if self._template is None:
-            img, edge = self.img, np.array(self.edge_size, dtype=np.int32)
+        if not hasattr(self, "_template"):
+            edge = np.array(self.edge_size, dtype=np.int32)
+            img = self.img_opener.open(self.img_path)
             img.seek(0)
             best_frame_id = np.argmax(list(islice(map(self._get_std, iter(img)), self.n_frames_for_template)))
             template = (img[best_frame_id][edge[1]: -edge[1], edge[0]: -edge[0]]).astype(np.float32)
@@ -61,19 +72,19 @@ class Alignment(object):
             mean_frame = np.divide(summation, img.length).astype(np.float32)
             edge_x1, edge_y1 = edge + mean_translation
             edge_x2, edge_y2 = mean_translation - edge
-            self._template = mean_frame[edge_y1: edge_y2, edge_x1: edge_x2]  # type: np.ndarray
-        # noinspection PyTypeChecker
+            self._template = cv2.medianBlur(mean_frame[edge_y1: edge_y2, edge_x1: edge_x2], 3)
         return self._template
 
     def align(self):
-        template, img, edge = self.template, self.img, np.array(self.edge_size, dtype=np.int32)
+        template, edge = self.template, np.array(self.edge_size, dtype=np.int32)
+        img = self.img_opener(self.img_path)
         frame_count, shape = img.length, img.shape
         displacement = list()
         summation = np.zeros(shape, dtype=np.float64)
         sq_summation = np.zeros(shape, dtype=np.float64)
         img.seek(0)
         for frame in iter(img):
-            frame = frame.astype(np.float32)
+            frame = cv2.medianBlur(frame.astype(np.float32), 3)
             translation = match(frame, template, edge)
             displacement.append(translation)
             apply_frame(summation, sq_summation, frame, *translation)
@@ -81,29 +92,52 @@ class Alignment(object):
         self.mean_frame = summation / frame_count
         self.std_frame = np.sqrt(np.maximum((sq_summation - summation ** 2 / frame_count) / frame_count, 0))
 
-    def save(self, target_path: str = None, output_shape: Point=(512, 512),
-             draw_limit: bool=False):
+    def save(self, target_path: str = None, output_shape: Point = (512, 512),
+             draw_limit: bool = False):
         target_path = target_path if target_path else self.target_path
+        self.target_path = target_path
         output = File(target_path, 'w+')
         for x in self._fields:
             if hasattr(self, x):
                 output.attrs[x] = getattr(self, x)
         output.attrs['img_path'] = path.relpath(self.img_path, target_path)
-        if self.displacement is not None:
+        if hasattr(self, "displacement"):
             output['displacement'] = self.displacement
-        if self._template is not None:
+        if hasattr(self, "_template"):
             output['template'] = self.template
         for name in ('mean_frame', 'std_frame'):
             if getattr(self, name, None) is not None:
                 frame = getattr(self, name)
                 if output_shape is not None:
                     frame = zoom(full_contrast(frame), np.divide(output_shape, frame.shape))
+                else:
+                    frame = full_contrast(frame)
                 frame = self.draw_limit(frame) if draw_limit else frame
                 save_tiff(frame, path.join(target_path, name + '.tif'))
 
-    def draw_limit(self, frame: np.ndarray, pixel_level: int=255):
+    @staticmethod
+    def _load(cls, file_path: str):
+        with open(path.join(file_path, "attributes.json")) as fp:
+            attrs = json.load(fp)
+        os.chdir(file_path)
+        sess = cls(str(Path(attrs["img_path"]).expanduser().resolve()), attrs["edge_size"])
+        sess.target_path = file_path
+        sess.displacement = np.load(path.join(file_path, "displacement.npy"))
+        sess._template = np.load(path.join(file_path, "template.npy"))
+        sess.mean_frame = TiffReader.open(path.join(file_path, "mean_frame.tif"))[0]
+        sess.std_frame = TiffReader.open(path.join(file_path, "std_frame.tif"))[0]
+        return sess
+
+    @classmethod
+    def load(cls, file_path: str) -> "Alignment":
+        sess = cls._load(cls, file_path)
+        if path.exists(path.join(file_path, "measurement.npz")):
+            sess.measurement = dict(np.load(path.join(file_path, "measurement.npz")))
+        return sess
+
+    def draw_limit(self, frame: np.ndarray, pixel_level: int = 255):
         x1, y1 = self.displacement.max(0)
-        x2, y2 = np.flipud(frame.shape) + self.displacement.min(0)
+        x2, y2 = np.flipud(frame.shape) + np.minimum(self.displacement.min(0), 0)
         frame[y1: y2, x1] = pixel_level
         if x2 != frame.shape[1]:
             frame[y1: y2, x2] = pixel_level
@@ -112,29 +146,32 @@ class Alignment(object):
             frame[y2, x1: x2] = pixel_level
         return frame
 
-    def measure_roi(self, roi_list: List[Roi], stretched: Tuple[int, int]=None) -> List[DataFrame]:
-        if stretched is not None:
-            stretch_index = np.divide(np.flipud(self.img[0].shape), stretched)
-            for roi in roi_list:
-                roi.stretch(*stretch_index)
-        roi_list = [roi for roi in roi_list if not roi.is_empty]
+    def measure_roi(self, roi_list: List[Roi]) -> List[DataFrame]:
+        tif_path = path.join(self.target_path, 'roi_frame.tif')
+        roi_size = tiffinfo(tif_path, ['Image Width: ', 'Image Length: '])  # type: ignore
+        original_size = tiffinfo(self.img_path, ['Image Width: ', 'Image Length: '])
+        stretch_index = np.divide(original_size, roi_size)
+        for roi in roi_list:
+            roi.stretch(*stretch_index)
         neuron_names = np.array([_roi_name2int(roi.name) for roi in roi_list])
         time_series = np.divide(np.arange(self.displacement.shape[0]), self.frame_rate)
         result: List[list] = [list() for _ in range(self._channel_no)]
-        self.img.seek(0)
-        img_iter = iter(self.img)
+        img = self.img_opener(self.img_path)
+        img.seek(0)
+        img_iter = iter(img)
+        valid_rois = [roi for roi in roi_list if roi.mask.sum() > 10]
         for dx, dy in self.displacement:
             for chan_id in range(self._channel_no):
-                frame = next(img_iter)
-                result[chan_id].append([masked_mean(frame, roi.x1 - dx, roi.y1 - dy, roi.mask) for roi in roi_list])
+                frame = cv2.medianBlur(next(img_iter), 3)
+                result[chan_id].append([masked_mean(frame, roi.x1 - dx, roi.y1 - dy, roi.mask) for roi in valid_rois])
         return [{'x': neuron_names, 'y': time_series, 'data': np.asarray(x).T} for x in result]
 
-    def save_roi(self, roi_list: List[Roi], stretched: Point=None, save_path: str=None) -> None:
-        result = self.measure_roi(roi_list, stretched)
-        save_path = save_path if save_path else self.target_path
-        save_file = File(save_path, 'w+')
+    def save_roi(self, roi_list: List[Roi]) -> Dict[str, np.ndarray]:
+        result = self.measure_roi(roi_list)
+        save_file = File(self.target_path, 'w+')
+        self.measurement = result[0]
         save_file['measurement'] = result[0]
-
+        return self.measurement
 
 class AlignmentTwoChannel(Alignment):
     two_channels = True
@@ -148,8 +185,9 @@ class AlignmentTwoChannel(Alignment):
 
     @property
     def template(self) -> np.ndarray:
-        if self._template is None:
-            img, edge = self.img, np.array(self.edge_size, dtype=np.int32)
+        if not hasattr(self, "_template"):
+            img = self.img_opener(self.img_path)
+            edge = np.array(self.edge_size, dtype=np.int32)
             img.seek(0)
             best_frame_id = np.argmax(list(islice(map(self._get_std, iter(img)), self.n_frames_for_template)))
             self.strong_channel = int(best_frame_id % 2)
@@ -165,19 +203,19 @@ class AlignmentTwoChannel(Alignment):
             mean_frame = np.divide(summation, img.length // 2).astype(np.float32)
             edge_x1, edge_y1 = edge + mean_translation
             edge_x2, edge_y2 = mean_translation - edge
-            self._template = mean_frame[edge_y1: edge_y2, edge_x1: edge_x2]  # type: np.ndarray
-        # noinspection PyTypeChecker
+            self._template = cv2.GaussianBlur(mean_frame[edge_y1: edge_y2, edge_x1: edge_x2], (5, 5), 1)
         return self._template
 
     def align(self):
-        template, img, edge = self.template, self.img, np.array(self.edge_size, dtype=np.int32)
+        template, edge = self.template, np.array(self.edge_size, dtype=np.int32)
+        img = self.img_opener(self.img_path)
         frame_count, shape = img.length // 2, img.shape
         displacement = list()
         summation = np.zeros(shape, dtype=np.float64)
         sq_summation = np.zeros(shape, dtype=np.float64)
         strong_channels = range(self.strong_channel, img.length, 2)
         for frame_id in strong_channels:
-            frame = img[frame_id].astype(np.float32)
+            frame = cv2.medianBlur(img[frame_id].astype(np.float32), 3)
             translation = match(frame, template, edge)
             displacement.append(translation)
             apply_frame(summation, sq_summation, frame, *translation)
@@ -185,20 +223,26 @@ class AlignmentTwoChannel(Alignment):
         self.mean_frame = summation / frame_count
         self.std_frame = np.sqrt(np.maximum((sq_summation - summation ** 2 / frame_count) / frame_count, 0))
 
-    def save_roi(self, roi_list: List[Roi], stretched: Point=None, save_path: str=None) -> None:
-        result = self.measure_roi(roi_list, stretched)
-        save_path = save_path if save_path else self.target_path
-        save_file = File(save_path, 'w+')
+    @classmethod
+    def load(cls, file_path: str) -> "AlignmentTwoChannel":
+        sess = AlignmentTwoChannel._load(cls, file_path)
+        if path.exists(path.join(file_path, "measurement-chan1.npz")):
+            sess.measurement = [np.load(path.join(file_path, f"measurement-chan{i}.npz")) for i in range(1, 3)]
+        return sess
+
+    def save_roi(self, roi_list: List[Roi]) -> List[Dict[str, np.ndarray]]:  # type: ignore
+        result: List[Dict[str, np.ndarray]] = self.measure_roi(roi_list)
+        save_file = File(self.target_path, 'w+')
+        self.measuremnt = result
         save_file['measurement-chan1'] = result[0]
         save_file['measurement-chan2'] = result[1]
-
+        return result
 
 def full_contrast(x: np.ndarray) -> np.ndarray:
     if np.issubdtype(x.dtype, np.integer) and np.iinfo(x.dtype).max < (x.max() * 255):
         return np.round((x - x.min()).astype(np.uint32) * 255 / (x.max() - x.min())).astype(np.uint8)
     else:
         return np.round((x - x.min()) * 255 / (x.max() - x.min())).astype(np.uint8)
-
 
 def match(frame: np.ndarray, template: np.ndarray, edge: np.ndarray) -> np.ndarray:
     min_location = cv2.minMaxLoc(cv2.matchTemplate(frame, template, cv2.TM_SQDIFF_NORMED))[2]
@@ -208,11 +252,7 @@ def match(frame: np.ndarray, template: np.ndarray, edge: np.ndarray) -> np.ndarr
             location[idx] = 0
     return location
 
-def _tsplit(string, *delimiters):
-    pattern = '|'.join(map(re.escape, delimiters))
-    return re.split(pattern, string)
-
-def _get_frame_rate(tif_path: str) -> float:
+def _get_frame_rate(tif_path: Path) -> float:
     sample_rate = _written_frame_rate(tif_path)
     if sample_rate:
         return sample_rate
@@ -226,60 +266,53 @@ def _get_frame_rate(tif_path: str) -> float:
         basename = path.split(tif_path)[-1]
         raise ValueError(f"can't figure out frame_rate for {basename}")
 
-def _written_frame_rate(tif_path: str) -> Union[float, None]:
-    basename = path.splitext(path.split(tif_path)[-1])[0]
-    if "Hz" in basename:
-        return float(next(x for x in _tsplit(basename, '-', '_') if "Hz" in x)[0: -2])
-    else:
-        return None
+hz_pattern = re.compile('[-_](\d+)[Hh]z')
 
-def _extra_file_frame_rate(tif_path: str) -> Union[float, None]:
-    folder = path.split(tif_path)[0]
-    for file_entry in scandir(folder):
-        if "Hz" in file_entry.name:
-            basename = path.splitext(file_entry.name)[0]
-            return float(next(x for x in basename.split("-_") if "Hz" in x)[0: -2])
+def _written_frame_rate(tif_path: Path) -> Union[float, None]:
+    match = hz_pattern.search(tif_path.stem)
+    return None if match is None else float(match[1])
+
+extra_framerate_pattern = re.compile("frame-rate-((?=.)([+-]?([0-9]*)(\.([0-9]+))?)).info")
+
+def _extra_file_frame_rate(tif_path: Path) -> Union[float, None]:
+    if tif_path.is_dir():
+        try:
+            info_file = next(tif_path.glob("frame-rate-*.info"))
+            match = extra_framerate_pattern.match(info_file.name)
+            if match:
+                return float(match.group(1))
+            else:
+                raise ValueError(f"frame rate file formatted incorrectly! filename: {info_file.name}")
+        except StopIteration:
+            return None
+    else:
+        for file_entry in tif_path.parent.iterdir():
+            match = hz_pattern.search(tif_path.stem)
+            if match is not None:
+                return float(match[1])
     return None
 
-def _tiffinfo_frame_rate(tif_path: str) -> float:
+def _tiffinfo_frame_rate(tif_path: Path) -> float:
     import subprocess as sp
-    # noinspection SpellCheckingInspection
-    output = sp.check_output(['tiffinfo', '-0', tif_path]).decode('utf-8')
+    output = sp.check_output(['tiffinfo', '-0', str(tif_path)]).decode('utf-8')
     start_idx = output.find('scanFrameRate')
-    if start_idx == -1:
-        start_idx = output.find('state.acq.frameRate')
-        return float(output[output.find('=', start_idx) + 1: output.find('\r', start_idx)])
-    else:
-        return float(output[output.find('=', start_idx) + 2: output.find('\n', start_idx)])
-
+    try:
+        if start_idx == -1:
+            start_idx = output.find('state.acq.frameRate')
+            return float(output[output.find('=', start_idx) + 1: output.find('\r', start_idx)])
+        else:
+            return float(output[output.find('=', start_idx) + 2: output.find('\n', start_idx)])
+    except ValueError:
+        raise ValueError("Fail to find frame rate info inside tiff file.")
 
 def _roi_name2int(roi_name: str) -> int:
     xs = [int(x) for x in roi_name.split('-')]
     return xs[1] + xs[0] * 10000 + sum([x * 100000000 * 10 ** idx for idx, x in enumerate(xs[2:])])
 
-
 __aligners = {True: AlignmentTwoChannel, False: Alignment}  # switch on attrs['two_channels']
 
-
-def load_aligner(file_path: str) -> Alignment:
-    file = File(file_path, 'r')
-    attrs = file.attrs
-    trigger = attrs['two_channels']
-    cls = __aligners[trigger]
-    img_path = attrs['img_path'] + ('' if attrs['img_path'].endswith('.tif') else '.tif')
-    if not path.isabs(img_path):
-        img_path = path.join(file_path, img_path)
-    obj = cls(img_path, attrs['edge_size'])
-    obj.target_path = file_path
-    for key, value in attrs.items():
-        setattr(obj, key, value)
-    if 'template' in file:
-        obj._template = file['template']
-    if 'displacement' in file:
-        obj.displacement = file['displacement']
-    for frame_type in ('mean_frame', 'std_frame'):
-        file_name = frame_type + '.tif'
-        for file_entry in scandir(file_path):
-            if file_name in file_entry.name:
-                setattr(obj, frame_type, TiffReader.open(file_entry.path)[0].astype(np.uint16))
-    return obj
+def load_aligner(file_path: str):
+    with open(path.join(file_path, "attributes.json")) as fp:
+        attrs = json.load(fp)
+    cls = __aligners[attrs['two_channels']]
+    return cls.load(file_path)

@@ -1,0 +1,7 @@
+.cache
+*.egg-info
+aligner/test/data
+build
+dist
+*.so
+*.c

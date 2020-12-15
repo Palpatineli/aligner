@@ -11,8 +11,8 @@ from uifunc import FolderSelector
 
 def distribute_log(folder: str):
     # noinspection PyArgumentList
-    files_in_need = [x for x in listdir() if path.splitext(x)[1] in {".tif", ".tiff"} and
-                     not path.isfile(path.join(path.splitext(x)[0], 'stimulus.log'))]
+    files_in_need = [x for x in listdir() if path.splitext(x)[1] in {".tif", ".tiff"}
+                     and not path.isfile(path.join(path.splitext(x)[0], 'stimulus.log'))]
     if len(files_in_need) < 1:
         return
     record_times = [(path.getmtime(x), x) for x in files_in_need]
